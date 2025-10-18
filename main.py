@@ -11,7 +11,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8394634711:AAHkV5UModE3zeP02B5PU4qmNXdXzqCsdKs"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "TOKEN"
 logging.basicConfig(level=logging.INFO)
 
 def contains_chinese(text):
@@ -334,3 +334,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
