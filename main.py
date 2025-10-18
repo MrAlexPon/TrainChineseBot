@@ -1,231 +1,336 @@
-import random
+import logging
 import sqlite3
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from googletrans import Translator
+import random
+import os
+import re
 
-import asyncio
+from dotenv import load_dotenv
+from pypinyin import pinyin, Style
+import translators as ts
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-API_TOKEN = "8145653514:AAGrpQHKkcvMWFKEOjlJ2r0j8BnsXYACznI"
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8394634711:AAHkV5UModE3zeP02B5PU4qmNXdXzqCsdKs"
+logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+def contains_chinese(text):
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
 
-translator = Translator()
+def get_chinese_from_russian(text):
+    try:
+        hanzi = ts.translate_text(text, translator="google", from_language="ru", to_language="zh")
+        return hanzi
+    except Exception as e:
+        logging.error(f"Russian to Chinese translation error: {e}")
+        return None
 
-# ---- БАЗА ДАННЫХ ----
-conn = sqlite3.connect("words.db")
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS words (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    word TEXT,
-    translation TEXT
-)
-""")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS stats (
-    user_id INTEGER PRIMARY KEY,
-    total_added INTEGER DEFAULT 0,
-    total_correct INTEGER DEFAULT 0,
-    total_wrong INTEGER DEFAULT 0
-)
-""")
-conn.commit()
-
-
-# ---- ФУНКЦИИ ----
-def add_word(user_id, word, translation):
-    cursor.execute("INSERT INTO words (user_id, word, translation) VALUES (?, ?, ?)", (user_id, word, translation))
-    cursor.execute("INSERT OR IGNORE INTO stats (user_id) VALUES (?)", (user_id,))
-    cursor.execute("UPDATE stats SET total_added = total_added + 1 WHERE user_id = ?", (user_id,))
+def init_db():
+    conn = sqlite3.connect('vocabulary.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_words (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            word TEXT NOT NULL,
+            pinyin TEXT,
+            translation TEXT NOT NULL,
+            added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
     conn.commit()
+    conn.close()
 
+def word_exists(user_id, word):
+    conn = sqlite3.connect('vocabulary.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM user_words WHERE user_id = ? AND word = ?', (user_id, word))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
 
-def get_words(user_id):
-    cursor.execute("SELECT word, translation FROM words WHERE user_id = ?", (user_id,))
-    return cursor.fetchall()
+def translate_word(word):
+    try:
+        return ts.translate_text(word, translator='google', from_language='zh', to_language='ru')
+    except Exception as e:
+        logging.error(f"Google Translate fail: {e}")
+        return "Ошибка перевода"
 
+def get_pinyin(hanzi):
+    try:
+        result = []
+        for sylls in pinyin(hanzi, style=Style.TONE, heteronym=False):
+            result.append(sylls[0])
+        return " ".join(result)
+    except Exception as e:
+        logging.error(f"pypinyin fail: {e}")
+        return ""
 
-def update_stats(user_id, correct):
-    cursor.execute("INSERT OR IGNORE INTO stats (user_id) VALUES (?)", (user_id,))
-    if correct:
-        cursor.execute("UPDATE stats SET total_correct = total_correct + 1 WHERE user_id = ?", (user_id,))
+def get_user_id(telegram_id):
+    conn = sqlite3.connect('vocabulary.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM users WHERE telegram_id = ?', (telegram_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def ensure_user_exists(telegram_id, username, first_name):
+    try:
+        conn = sqlite3.connect('vocabulary.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT OR IGNORE INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)',
+            (telegram_id, username, first_name)
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка регистрации пользователя: {e}")
+    finally:
+        conn.close()
+
+def add_word_to_db(user_id, word, pinyin, translation):
+    if not user_id:
+        logging.error('add_word_to_db: user_id is None!')
+        return
+    if word_exists(user_id, word):  # Проверка на существование слова в словаре
+        logging.info(f"Слово '{word}' уже есть в словаре пользователя {user_id}, добавление пропущено")
+        return
+    try:
+        conn = sqlite3.connect('vocabulary.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO user_words (user_id, word, pinyin, translation) VALUES (?, ?, ?, ?)',
+            (user_id, word, pinyin, translation)
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка добавления слова: {e}")
+    finally:
+        conn.close()
+
+def get_user_words(user_id):
+    conn = sqlite3.connect('vocabulary.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT word, pinyin, translation FROM user_words WHERE user_id = ?', (user_id,))
+    words = cursor.fetchall()
+    conn.close()
+    return words
+
+def delete_word(user_id, word):
+    try:
+        conn = sqlite3.connect('vocabulary.db')
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM user_words WHERE user_id = ? AND word = ?', (user_id, word))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка удаления слова: {e}")
+    finally:
+        conn.close()
+
+common_word_pairs = [
+    ("你好", "привет"), ("谢谢", "спасибо"), ("再见", "до свидания"), ("是", "да"), ("不", "нет"),
+    ("好", "хорошо"), ("爱", "любовь"), ("朋友", "друг"), ("家庭", "семья"), ("学校", "школа"),
+    ("工作", "работа"), ("吃饭", "кушать"), ("水", "вода"), ("茶", "чай"), ("咖啡", "кофе"),
+    ("书", "книга"), ("电影", "фильм"), ("音乐", "музыка"), ("城市", "город"),
+    ("国家", "страна"), ("时间", "время"), ("今天", "сегодня"), ("明天", "завтра")
+]
+
+def get_smart_distractors(correct_translation, count=3):
+    freq_translations = [pair[1] for pair in common_word_pairs if pair[1] != correct_translation]
+    random.shuffle(freq_translations)
+    return freq_translations[:count]
+
+MAIN_MENU = [
+    [KeyboardButton("➕ Добавить слово"), KeyboardButton("🎯 Тренировка")],
+    [KeyboardButton("📚 Мои слова"), KeyboardButton("🗑️ Удалить слово")],
+    [KeyboardButton("ℹ️ Помощь")]
+]
+MAIN_MENU_MARKUP = ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True)
+
+START_TEXT = (
+    "🤖 Добро пожаловать в бот для изучения китайских иероглифов!\n\n"
+    "📝 Как пользоваться:\n"
+    "1. Добавляйте иероглифы для изучения.\n"
+    "2. Практикуйте слова в тренировке.\n"
+    "3. Улучшайте свой словарный запас.\n\n"
+    "Просто отправьте китайский иероглиф, слово или фразу — бот покажет пиньинь и перевод!\n"
+    "Например: 很酷 или 很酷 очень круто\n"
+    "Можно и на русском — бот сам найдёт иероглиф! Например: телефон"
+)
+
+HELP_TEXT = (
+    "ℹ️ Помощь\n\n"
+    "— Вы можете отправить китайский иероглиф (или слово), а можете просто слово по-русски — бот всё обработает.\n"
+    "— 'Мои слова' — просмотр вашего словаря.\n"
+    "— 'Удалить слово' — стереть запись по иероглифу.\n"
+    "— 'Тренировка' — выбирайте правильный перевод из 4 вариантов!"
+)
+
+right_emoji = "✅"
+wrong_emoji = "❌"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    ensure_user_exists(user.id, user.username, user.first_name)
+    await update.message.reply_text(START_TEXT, reply_markup=MAIN_MENU_MARKUP)
+
+async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    ensure_user_exists(user.id, user.username, user.first_name)
+    user_id = get_user_id(user.id)
+    text = update.message.text.strip()
+
+    if context.user_data.get('training_words'):
+        await handle_training_response(update, context)
+        return
+
+    if text == "➕ Добавить слово":
+        await update.message.reply_text(
+            "Просто отправьте китайский иероглиф, слово или фразу — или по-русски!\nБот сам найдёт перевод — иероглиф, пиньинь, русское объяснение.",
+            reply_markup=MAIN_MENU_MARKUP
+        )
+    elif text == "🎯 Тренировка":
+        words = get_user_words(user_id)
+        if not words:
+            await update.message.reply_text("Нет слов для тренировки.", reply_markup=MAIN_MENU_MARKUP)
+            return
+        context.user_data['training_words'] = random.sample(words, len(words))
+        context.user_data['current_training_index'] = 0
+        await start_training(update, context)
+    elif text == "📚 Мои слова":
+        words = get_user_words(user_id)
+        if not words:
+            await update.message.reply_text("Ваш словарь пуст.", reply_markup=MAIN_MENU_MARKUP)
+        else:
+            word_list = "\n".join([f"{w} ({p})\n{t}" if p else f"{w}\n{t}" for w, p, t in words])
+            await update.message.reply_text(f"📚 Ваши слова:\n\n{word_list}", reply_markup=MAIN_MENU_MARKUP)
+    elif text == "🗑️ Удалить слово":
+        words = get_user_words(user_id)
+        if not words:
+            await update.message.reply_text("В словаре пока ничего нет.", reply_markup=MAIN_MENU_MARKUP)
+        else:
+            word_list = "\n".join([f"{w}" for w, p, t in words])
+            await update.message.reply_text(
+                f"Введите иероглиф для удаления:\n{word_list}",
+                reply_markup=MAIN_MENU_MARKUP
+            )
+            context.user_data['awaiting_deletion'] = True
+    elif text == "ℹ️ Помощь":
+        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_MENU_MARKUP)
+    elif context.user_data.get('awaiting_deletion'):
+        to_delete = text.strip()
+        if not word_exists(user_id, to_delete):
+            await update.message.reply_text(f"Слово {to_delete} не найдено.", reply_markup=MAIN_MENU_MARKUP)
+        else:
+            delete_word(user_id, to_delete)
+            await update.message.reply_text(f"✅ Удалено: {to_delete}", reply_markup=MAIN_MENU_MARKUP)
+        context.user_data['awaiting_deletion'] = False
     else:
-        cursor.execute("UPDATE stats SET total_wrong = total_wrong + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+        # если вначале есть китайский — стандартный ввод
+        parts = text.split(maxsplit=1)
+        if contains_chinese(parts[0]):
+            hanzi = parts[0]
+            user_translation = parts[1] if len(parts) == 2 else None
+            pinyin_text = get_pinyin(hanzi)
+            translation = user_translation if user_translation else translate_word(hanzi)
+            msg = f"{hanzi}"
+            if pinyin_text:
+                msg += f" ({pinyin_text})"
+            msg += f"\n{translation}"
+            add_word_to_db(user_id, hanzi, pinyin_text, translation)
+            await update.message.reply_text(msg, reply_markup=MAIN_MENU_MARKUP)
+        else:
+            # Иначе переводим всю фразу целиком с русского на китайский
+            hanzi = get_chinese_from_russian(text)
+            if not hanzi or not contains_chinese(hanzi):
+                await update.message.reply_text(
+                    "Не удалось найти подходящий китайский перевод для этого слова или фразы.",
+                    reply_markup=MAIN_MENU_MARKUP
+                )
+                return
+            pinyin_text = get_pinyin(hanzi)
+            translation = text
+            msg = f"{hanzi}"
+            if pinyin_text:
+                msg += f" ({pinyin_text})"
+            msg += f"\n{translation}"
+            add_word_to_db(user_id, hanzi, pinyin_text, translation)
+            await update.message.reply_text(msg, reply_markup=MAIN_MENU_MARKUP)
 
+async def start_training(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    user_id = get_user_id(user.id)
+    words = context.user_data['training_words']
+    index = context.user_data['current_training_index']
+    if index >= len(words):
+        context.user_data.pop('training_words', None)
+        context.user_data.pop('current_training_index', None)
+        context.user_data.pop('correct_answer', None)
+        await update.message.reply_text(
+            "🎉 Тренировка завершена! Всё хорошо!",
+            reply_markup=MAIN_MENU_MARKUP)
+        return
 
-def get_stats(user_id):
-    cursor.execute("SELECT total_added, total_correct, total_wrong FROM stats WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row if row else (0, 0, 0)
+    current_word, pinyin_text, correct_translation = words[index]
+    all_trans = [t for w, p, t in words if t != correct_translation and t not in ("None", "")]
+    random.shuffle(all_trans)
+    distractors = get_smart_distractors(correct_translation, count=3-len(all_trans)) if len(all_trans) < 3 else []
+    pool = all_trans[:3] + distractors
+    options = pool[:3] if len(pool) >= 3 else pool + get_smart_distractors(correct_translation, 3-len(pool))
+    options.append(correct_translation)
+    random.shuffle(options)
 
+    context.user_data['correct_answer'] = correct_translation
+    context.user_data['current_training_index'] = index
 
-# ---- ХЕНДЛЕРЫ ----
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    await message.answer(
-        "👋 Привет! Я бот для изучения слов.\n\n"
-        "📌 Команды:\n"
-        "➕ Добавить слово: `/add слово перевод`\n"
-        "   (можно и без перевода: `/add 苹果`)\n"
-        "🎯 Тренировка (случайные режимы): `/train`\n"
-        "🃏 Флешкарты: `/flashcards`\n"
-        "📊 Статистика: `/stats`",
-        parse_mode="Markdown"
+    display = f"{current_word}" + (f" ({pinyin_text})" if pinyin_text else "")
+    keyboard = [[KeyboardButton(opt)] for opt in options]
+    keyboard.append([KeyboardButton("⏹️ Стоп тренировка")])
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    await update.message.reply_text(
+        f"Что означает?\n\n{display}",
+        reply_markup=reply_markup
     )
 
-
-@dp.message(Command("add"))
-async def add(message: types.Message):
-    user_id = message.from_user.id
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Напиши слово или слово + перевод.\nПример:\n`/add 苹果 яблоко`\nили `/add 苹果`",
-                             parse_mode="Markdown")
+async def handle_training_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⏹️ Стоп тренировка":
+        context.user_data.pop('training_words', None)
+        context.user_data.pop('current_training_index', None)
+        context.user_data.pop('correct_answer', None)
+        await update.message.reply_text("Тренировка остановлена.", reply_markup=MAIN_MENU_MARKUP)
         return
 
-    text = parts[1]
-
-    if " " in text:
-        word, translation = text.split(maxsplit=1)
-    else:
-        word = text
-        try:
-            result = translator.translate(word, src="zh-cn", dest="ru")
-            translation = result.text
-        except Exception:
-            await message.answer("⚠️ Не удалось перевести автоматически. Укажи перевод вручную.")
-            return
-
-    add_word(user_id, word, translation)
-    await message.answer(f"✅ Добавлено: {word} → {translation}")
-
-
-@dp.message(Command("train"))
-async def train(message: types.Message):
-    user_id = message.from_user.id
-    words = get_words(user_id)
-    if not words:
-        await message.answer("Ты ещё не добавил слова. Используй `/add слово перевод`")
+    correct_answer = context.user_data.get('correct_answer')
+    if not correct_answer:
+        context.user_data['current_training_index'] += 1
+        await start_training(update, context)
         return
-
-    mode = random.choice(["choice", "reverse", "input", "flash", "odd"])
-    word, right = random.choice(words)
-
-    if mode == "choice":
-        all_translations = [t for _, t in words]
-        options = random.sample(all_translations, min(3, len(all_translations)))
-        if right not in options:
-            options.append(right)
-        random.shuffle(options)
-
-        builder = InlineKeyboardBuilder()
-        for opt in options:
-            builder.button(text=opt, callback_data=f"ans:{word}:{right}:{opt}")
-        builder.adjust(1)
-        await message.answer(f"❓ Что значит слово: *{word}* ?", parse_mode="Markdown", reply_markup=builder.as_markup())
-
-    elif mode == "reverse":
-        await message.answer(f"🔄 Переведи на китайский: *{right}* (введи ответ)")
-        dp.message.register(lambda msg: check_input(msg, right, word), lambda msg: True, once=True)
-
-    elif mode == "input":
-        await message.answer(f"⌨️ Введи перевод слова: *{word}*")
-        dp.message.register(lambda msg: check_input(msg, right, word), lambda msg: True, once=True)
-
-    elif mode == "flash":
-        builder = InlineKeyboardBuilder()
-        builder.button(text="Показать перевод", callback_data=f"flash:{word}:{right}")
-        builder.adjust(1)
-        await message.answer(f"🃏 Вспомни перевод слова: *{word}*", parse_mode="Markdown",
-                             reply_markup=builder.as_markup())
-
-    elif mode == "odd":
-        if len(words) < 4:
-            await train(message)
-            return
-        all_words = random.sample(words, 4)
-        translations = [t for _, t in all_words]
-        odd = random.choice(translations)
-        builder = InlineKeyboardBuilder()
-        for opt in translations:
-            builder.button(text=opt, callback_data=f"odd:{right}:{opt}:{odd}")
-        builder.adjust(1)
-        await message.answer("🧐 Найди лишний перевод среди этих вариантов:", reply_markup=builder.as_markup())
-
-
-async def check_input(message: types.Message, right, word):
-    user_id = message.from_user.id
-    answer = message.text.strip()
-    if answer == word or answer == right:
-        update_stats(user_id, True)
-        await message.answer(f"✅ Верно! {word} → {right}")
+    if text == correct_answer:
+        await update.message.reply_text(f"{right_emoji} Верно!", reply_markup=MAIN_MENU_MARKUP)
     else:
-        update_stats(user_id, False)
-        await message.answer(f"❌ Неверно! {word} → {right}")
+        await update.message.reply_text(f"{wrong_emoji} Нет. Верно: {correct_answer}", reply_markup=MAIN_MENU_MARKUP)
+    context.user_data['current_training_index'] += 1
+    await start_training(update, context)
 
+def main():
+    init_db()
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages))
+    application.run_polling()
+    print("Бот запущен!")
 
-@dp.callback_query(lambda c: c.data.startswith("ans:"))
-async def check_answer(callback: types.CallbackQuery):
-    _, word, right, chosen = callback.data.split(":")
-    user_id = callback.from_user.id
-    if chosen == right:
-        update_stats(user_id, True)
-        await callback.message.answer(f"✅ Верно! {word} → {right}")
-    else:
-        update_stats(user_id, False)
-        await callback.message.answer(f"❌ Неверно! {word} → {right}, а не {chosen}")
-
-
-@dp.callback_query(lambda c: c.data.startswith("flash:"))
-async def flash_answer(callback: types.CallbackQuery):
-    _, word, right = callback.data.split(":")
-    await callback.message.answer(f"👉 {word} → {right}")
-
-
-@dp.callback_query(lambda c: c.data.startswith("odd:"))
-async def check_odd(callback: types.CallbackQuery):
-    _, right, chosen, odd = callback.data.split(":")
-    if chosen == odd:
-        await callback.message.answer(f"✅ Верно! Лишнее: {odd}")
-    else:
-        await callback.message.answer(f"❌ Неверно! Лишнее было: {odd}")
-
-
-@dp.message(Command("flashcards"))
-async def flashcards(message: types.Message):
-    user_id = message.from_user.id
-    words = get_words(user_id)
-    if not words:
-        await message.answer("Ты ещё не добавил слова. Используй `/add слово перевод`")
-        return
-
-    word, right = random.choice(words)
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Показать перевод", callback_data=f"flash:{word}:{right}")
-    builder.adjust(1)
-    await message.answer(f"🃏 Вспомни перевод слова: *{word}*", parse_mode="Markdown", reply_markup=builder.as_markup())
-
-
-@dp.message(Command("stats"))
-async def stats(message: types.Message):
-    user_id = message.from_user.id
-    total_added, total_correct, total_wrong = get_stats(user_id)
-    await message.answer(
-        f"📊 Твоя статистика:\n"
-        f"➕ Добавлено слов: {total_added}\n"
-        f"✅ Правильных ответов: {total_correct}\n"
-        f"❌ Ошибок: {total_wrong}"
-    )
-
-
-# ---- ЗАПУСК ----
-if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(dp.start_polling(bot))
+if __name__ == '__main__':
+    main()
